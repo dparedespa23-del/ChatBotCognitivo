@@ -1,0 +1,121 @@
+x-backend: &backend
+  build:
+    context: ./backend
+  restart: unless-stopped
+  init: true
+  environment: &backend-environment
+    DJANGO_DEBUG: "false"
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Genera las variables con py preparar_despliegue.py}
+    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-chatcognitivo.tech,www.chatcognitivo.tech,localhost,127.0.0.1}
+    DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-https://chatcognitivo.tech,https://www.chatcognitivo.tech}
+    DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-true}
+    DJANGO_COOKIE_SECURE: ${DJANGO_COOKIE_SECURE:-true}
+    DJANGO_TRUST_PROXY_HEADERS: "true"
+    DJANGO_DB_PATH: /data/db.sqlite3
+    OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-deepseek-r1:8b}
+    OLLAMA_NUM_GPU: ${OLLAMA_NUM_GPU:-0}
+    OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-4096}
+    OLLAMA_CHAT_MAX_TOKENS: ${OLLAMA_CHAT_MAX_TOKENS:-192}
+    OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+  volumes:
+    - datos:/data
+    - estaticos:/app/staticfiles
+  networks:
+    - aplicacion
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "80"
+    volumes:
+      - estaticos:/usr/share/nginx/django-static:ro
+    networks:
+      - aplicacion
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  backend:
+    <<: *backend
+    environment:
+      <<: *backend-environment
+      DJANGO_ADMIN_USERNAME: ${DJANGO_ADMIN_USERNAME:-admin}
+      DJANGO_ADMIN_PASSWORD: ${DJANGO_ADMIN_PASSWORD:?Genera las variables con py preparar_despliegue.py}
+      DJANGO_ALLOW_INSECURE_ADMIN: ${DJANGO_ALLOW_INSECURE_ADMIN:-false}
+    depends_on:
+      modelo:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    stop_grace_period: 220s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/salud/', timeout=4).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 40s
+      retries: 5
+
+  worker:
+    <<: *backend
+    command: ["python", "manage.py", "procesar_semanas", "--continuo", "--intervalo", "15"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:0.18.2
+    profiles: ["ollama"]
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+      # Dos espacios conservan prefijos distintos del chat y los reportes.
+      # El worker sigue cediendo al chat; no se multiplican procesos del modelo.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_MULTIUSER_CACHE: ${OLLAMA_MULTIUSER_CACHE:-true}
+    volumes:
+      - modelos:/root/.ollama
+    networks:
+      - aplicacion
+
+  modelo:
+    image: ollama/ollama:0.18.2
+    restart: "on-failure:3"
+    environment:
+      OLLAMA_HOST: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-deepseek-r1:8b}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        intentos=0
+        until ollama list >/dev/null 2>&1; do
+          intentos=$$((intentos + 1))
+          if [ "$$intentos" -ge 90 ]; then
+            echo "Ollama no está disponible. Revisa OLLAMA_URL y la conectividad."
+            exit 1
+          fi
+          sleep 2
+        done
+        if ollama show "$$OLLAMA_MODEL" >/dev/null 2>&1; then
+          echo "El modelo solicitado ya está disponible."
+          exit 0
+        fi
+        exec ollama pull "$$OLLAMA_MODEL"
+    networks:
+      - aplicacion
+
+volumes:
+  datos:
+  estaticos:
+  modelos:
+
+networks:
+  aplicacion:
